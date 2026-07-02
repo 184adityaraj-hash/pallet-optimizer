@@ -29,7 +29,7 @@ st.markdown("""
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-FILE_PATH        = r"C:\Users\Lenovo\Downloads\Dimensions_SKUs.xlsx"
+FILE_PATH        = "Dimensions_SKUs.xlsx"
 DEFAULT_LAYERS   = 5
 LOW_UTIL_WARN    = 60
 STACK_HEIGHT_MAX = 10.0
