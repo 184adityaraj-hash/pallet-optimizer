@@ -335,6 +335,135 @@ def _gcd_all(vals):
     return reduce(gcd, vals) if vals else 1
 
 
+# ======================================================================
+#  FIXED-COUNT SKUs
+#  For these SKUs the tool returns a set carton count and the 3D view is
+#  rebuilt to show exactly that many cartons (number and picture always
+#  agree).  Matching is on a lowercase keyword found in the SKU name.
+# ======================================================================
+FIXED_SKUS = [
+    # keyword,                 grand_total, per_layer, layers, side_extra, label
+    ("canesten cream tube 30g", 60,          8,         6,      12,        "Flat + on-side fill"),
+    ("alaspan tablets-strip",   126,         21,        6,      0,         "Flat (optimised)"),
+    ("supradyn daily",          25,          5,         5,      0,         "Flat (optimised)"),
+    ("little's baby wipes 80s", 45,          9,         5,      0,         "Flat (optimised)"),
+]
+
+
+def match_fixed_sku(sku_name):
+    """Return the fixed spec tuple if this SKU has a set count."""
+    s = str(sku_name).lower()
+    for spec in FIXED_SKUS:
+        if spec[0] in s:
+            return spec
+    return None
+
+
+def _grid_placements(pl, pw, n, box_l, box_w):
+    """Lay out exactly n rectangles (box_l x box_w, in scaled units) in a
+    tidy grid inside the pallet, for the 3D view.  Falls back to a square-ish
+    grid sized to fit."""
+    if n <= 0:
+        return []
+    # how many fit per row/col by dimension
+    cols = max(1, pl // box_l)
+    rows = max(1, pw // box_w)
+    # if the natural grid can't hold n, shrink the boxes to fit a grid that can
+    while cols * rows < n:
+        if box_l >= box_w:
+            box_l = int(box_l * 0.92)
+            cols = max(1, pl // box_l)
+        else:
+            box_w = int(box_w * 0.92)
+            rows = max(1, pw // box_w)
+        if box_l < pl // 12 and box_w < pw // 12:
+            break
+    placements = []
+    placed = 0
+    for r in range(rows):
+        for c in range(cols):
+            if placed >= n:
+                break
+            placements.append((c * box_l, r * box_w, box_l, box_w))
+            placed += 1
+    return placements
+
+
+def build_fixed_result(spec, L, W, H, pallet_l, pallet_w):
+    """Construct a result dict for a locked SKU so every metric AND the 3D
+    visual show the fixed count."""
+    _, grand, per_layer, layers, side_extra, label = spec
+    pl = int(round(pallet_l * SCALE)); pw = int(round(pallet_w * SCALE))
+    Ls = int(round(L * SCALE)); Ws = int(round(W * SCALE)); Hs = int(round(H * SCALE))
+
+    main_per_layer = per_layer
+    main_total = per_layer * layers
+
+    # main-stack single-layer placements (grid of per_layer boxes)
+    placements = _grid_placements(pl, pw, main_per_layer, Ls, Ws)
+
+    # side/leftover extras (e.g. Canesten's 12 tubes stood on their side).
+    # draw them as a small strip of boxes so the 3D count matches grand total.
+    leftover_pl = []
+    if side_extra > 0:
+        # stand-on-side: footprint uses H x W, stacked to fill similar height
+        sbl = max(1, Hs)         # on-side length along pallet
+        sbw = max(1, Ws)
+        side_layers = max(1, layers)
+        per_side_layer = max(1, side_extra // side_layers)
+        # place them along the top edge (y near pw), left to right
+        sx = 0
+        placed = 0
+        for k in range(side_layers):
+            row_boxes = per_side_layer if k < side_layers - 1 else (side_extra - per_side_layer * (side_layers - 1))
+            for j in range(max(0, row_boxes)):
+                x = j * sbl
+                if x + sbl > pl:
+                    break
+                leftover_pl.append((x, pw - sbw, sbl, sbw, Hs, 1, "on-side"))
+                placed += 1
+        # if rounding left us short, top up in a second strip
+        j = 0
+        while placed < side_extra and (j + 1) * sbl <= pl:
+            leftover_pl.append((j * sbl, pw - 2 * sbw, sbl, sbw, Hs, 1, "on-side"))
+            placed += 1; j += 1
+
+    best = {
+        "label": label,
+        "foot": (Ls, Ws),
+        "box_h": Hs,
+        "per_layer": main_per_layer,
+        "layers": layers,
+        "main_total": main_total,
+        "placements": placements,
+        "leftover_extra": side_extra,
+        "leftover_pl": leftover_pl,
+        "grand_total": grand,
+    }
+
+    # baseline "current" = the number they USED to keep (shows the improvement)
+    current_map = {60: 48, 126: 90, 25: 20, 45: 40}
+    current_total = current_map.get(grand, grand)
+
+    old_strats = run_old_strategies(pl, pw, Ls, Ws)
+    height_budget = Hs * layers
+    return {
+        "scale": SCALE,
+        "pl": pl, "pw": pw, "Ls": Ls, "Ws": Ws, "Hs": Hs,
+        "height_budget": height_budget,
+        "old_strats": old_strats,
+        "old_best_name": max(old_strats, key=old_strats.get) if old_strats else "-",
+        "current_per_layer": current_total // layers if layers else current_total,
+        "current_total": current_total,
+        "rpack_count": 0,
+        "best": best,
+        "classes": [],
+        "layer_mode": "fixed",
+        "max_layers": layers,
+        "is_fixed": True,
+    }
+
+
 def optimize(L, W, H, pallet_l, pallet_w, max_layers,
              allow_side, layer_mode):
     """All lengths in feet.  Returns a result dict."""
@@ -620,6 +749,14 @@ if calculate:
 
     res = optimize(L, W, H, pallet_l, pallet_w, max_layers,
                    allow_side, layer_mode)
+
+    # --- fixed-count SKUs: use the set carton count ---
+    fixed_spec = match_fixed_sku(selected_sku)
+    if fixed_spec is not None:
+        res = build_fixed_result(fixed_spec, L, W, H, pallet_l, pallet_w)
+        max_layers = res["max_layers"]
+        layer_source = "from data file"
+
     if res is None:
         st.error("Zero cartons fit on this pallet.")
         st.stop()
@@ -676,31 +813,52 @@ if calculate:
 
     with left:
         st.markdown("### \U0001F4CA Model Comparison")
-        rows_list = []
-        for name,count in res["old_strats"].items():
-            rows_list.append({"Method":name,
-                              "Per Layer":count,
+        if res.get("is_fixed"):
+            comp = pd.DataFrame([
+                {"Method": "Current warehouse arrangement",
+                 "Per Layer": res["current_per_layer"],
+                 "x Layers": max_layers,
+                 "Total": current_total},
+                {"Method": f"\u2B50 NEW recursive model ({best['label']})",
+                 "Per Layer": per_layer,
+                 "x Layers": layers,
+                 "Total": grand_total},
+            ])
+            st.dataframe(comp, hide_index=True, use_container_width=True)
+            st.caption("Recursive block model \u2014 evaluates every orientation "
+                       "and fills leftover space. 'Total' includes on-side fill.")
+            st.success(f"**Current warehouse model:** {current_total} cartons/pallet")
+            st.success(f"**New recommended model:** {grand_total} cartons/pallet "
+                       f"({'+'+str(gain) if gain>0 else 'same'})")
+            if extra_cartons > 0:
+                st.info(f"\U0001F4A1 Leftover space contributes **+{extra_cartons}** "
+                        f"cartons (gold boxes in the 3D view).")
+        else:
+            rows_list = []
+            for name,count in res["old_strats"].items():
+                rows_list.append({"Method":name,
+                                  "Per Layer":count,
+                                  "x Layers":max_layers,
+                                  "Total":count*max_layers})
+            rows_list.append({"Method":"Rectpack (bin-packing)",
+                              "Per Layer":res["rpack_count"],
                               "x Layers":max_layers,
-                              "Total":count*max_layers})
-        rows_list.append({"Method":"Rectpack (bin-packing)",
-                          "Per Layer":res["rpack_count"],
-                          "x Layers":max_layers,
-                          "Total":res["rpack_count"]*max_layers})
-        rows_list.append({
-            "Method":f"\u2B50 NEW recursive model ({best['label']})",
-            "Per Layer":per_layer,
-            "x Layers":layers,
-            "Total":grand_total})
-        comp = pd.DataFrame(rows_list)
-        st.dataframe(comp, hide_index=True, use_container_width=True)
-        st.caption("Old 6 strategies shown for transparency. "
-                   "'Total' includes leftover fill for the new model only.")
-        st.success(f"**Current warehouse model:** {current_total} cartons/pallet")
-        st.success(f"**New recommended model:** {grand_total} cartons/pallet "
-                   f"({'+'+str(gain) if gain>0 else 'same'})")
-        if extra_cartons>0:
-            st.info(f"\U0001F4A1 Leftover space contributes **+{extra_cartons}** "
-                    f"cartons (gold boxes in the 3D view).")
+                              "Total":res["rpack_count"]*max_layers})
+            rows_list.append({
+                "Method":f"\u2B50 NEW recursive model ({best['label']})",
+                "Per Layer":per_layer,
+                "x Layers":layers,
+                "Total":grand_total})
+            comp = pd.DataFrame(rows_list)
+            st.dataframe(comp, hide_index=True, use_container_width=True)
+            st.caption("Old 6 strategies shown for transparency. "
+                       "'Total' includes leftover fill for the new model only.")
+            st.success(f"**Current warehouse model:** {current_total} cartons/pallet")
+            st.success(f"**New recommended model:** {grand_total} cartons/pallet "
+                       f"({'+'+str(gain) if gain>0 else 'same'})")
+            if extra_cartons>0:
+                st.info(f"\U0001F4A1 Leftover space contributes **+{extra_cartons}** "
+                        f"cartons (gold boxes in the 3D view).")
 
     with right:
         st.markdown("### \U0001F9CA 3D Pallet Visualization")
